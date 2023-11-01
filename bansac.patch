@@ -1,0 +1,362 @@
+diff --git a/modules/calib3d/include/opencv2/calib3d.hpp b/modules/calib3d/include/opencv2/calib3d.hpp
+index 6558d2caf9..6e9648ab6c 100644
+--- a/modules/calib3d/include/opencv2/calib3d.hpp
++++ b/modules/calib3d/include/opencv2/calib3d.hpp
+@@ -549,7 +549,7 @@ enum RobotWorldHandEyeCalibrationMethod
+ };
+
+ enum SamplingMethod { SAMPLING_UNIFORM, SAMPLING_PROGRESSIVE_NAPSAC, SAMPLING_NAPSAC,
+-        SAMPLING_PROSAC };
++        SAMPLING_PROSAC, SAMPLING_BANSAC, SAMPLING_PBANSAC};
+ enum LocalOptimMethod {LOCAL_OPTIM_NULL, LOCAL_OPTIM_INNER_LO, LOCAL_OPTIM_INNER_AND_ITER_LO,
+         LOCAL_OPTIM_GC, LOCAL_OPTIM_SIGMA};
+ enum ScoreMethod {SCORE_METHOD_RANSAC, SCORE_METHOD_MSAC, SCORE_METHOD_MAGSAC, SCORE_METHOD_LMEDS};
+@@ -569,6 +569,7 @@ struct CV_EXPORTS_W_SIMPLE UsacParams
+     CV_PROP_RW SamplingMethod sampler;
+     CV_PROP_RW ScoreMethod score;
+     CV_PROP_RW double threshold;
++    CV_PROP_RW std::vector<float> weights;
+ };
+
+ /** @brief Converts a rotation matrix to a rotation vector or vice versa.
+diff --git a/modules/calib3d/src/usac.hpp b/modules/calib3d/src/usac.hpp
+index 6dc79fdc55..24b03da3e1 100644
+--- a/modules/calib3d/src/usac.hpp
++++ b/modules/calib3d/src/usac.hpp
+@@ -761,6 +761,7 @@ public:
+     virtual const std::vector<int> &getGridCellNumber () const = 0;
+     virtual int getRandomGeneratorState () const = 0;
+     virtual int getMaxItersBeforeLO () const = 0;
++    virtual std::vector<float> getWeights () const = 0;
+
+     // setters
+     virtual void setLocalOptimization (LocalOptimMethod lo_) = 0;
+@@ -776,6 +777,7 @@ public:
+     virtual void setLOSampleSize (int lo_sample_size) = 0;
+     virtual void setThresholdMultiplierLO (double thr_mult) = 0;
+     virtual void setRandomGeneratorState (int state) = 0;
++    virtual void setWeights (std::vector<float> weights_) = 0;
+
+     virtual void maskRequired (bool required) = 0;
+     virtual bool isMaskRequired () const = 0;
+diff --git a/modules/calib3d/src/usac/ransac_solvers.cpp b/modules/calib3d/src/usac/ransac_solvers.cpp
+index fe64907ec0..194c8ec1d6 100644
+--- a/modules/calib3d/src/usac/ransac_solvers.cpp
++++ b/modules/calib3d/src/usac/ransac_solvers.cpp
+@@ -93,8 +93,10 @@ protected:
+     const Ptr<Degeneracy> _degeneracy;
+     const Ptr<LocalOptimization> _local_optimization;
+     const Ptr<FinalModelPolisher> model_polisher;
++    const Ptr<Error> error;
+
+-    const int points_size, state;
++    const double threshold;
++    const int points_size, state;
+     const bool parallel;
+ public:
+
+@@ -102,12 +104,14 @@ public:
+             const Ptr<Sampler> &sampler_, const Ptr<TerminationCriteria> &termination_criteria_,
+             const Ptr<ModelVerifier> &model_verifier_, const Ptr<Degeneracy> &degeneracy_,
+             const Ptr<LocalOptimization> &local_optimization_, const Ptr<FinalModelPolisher> &model_polisher_,
++            const Ptr<Error> &error_, double threshold_,
+             bool parallel_=false, int state_ = 0) :
+
+             params (params_), _estimator (estimator_), _quality (quality_), _sampler (sampler_),
+             _termination_criteria (termination_criteria_), _model_verifier (model_verifier_),
+             _degeneracy (degeneracy_), _local_optimization (local_optimization_),
+-            model_polisher (model_polisher_), points_size (points_size_), state(state_),
++            model_polisher (model_polisher_), error (error_), threshold (threshold_),
++            points_size (points_size_), state(state_),
+             parallel(parallel_) {}
+
+     bool run(Ptr<RansacOutput> &ransac_output) {
+@@ -125,6 +129,50 @@ public:
+         Mat best_model;
+         int final_iters;
+
++        //------------------------------------------------------------------------------------------------------------------------------
++        // BANSAC CONFIGURATION
++        std::vector<unsigned short> sampling(points_size);  // Sampling weights
++        std::vector<float> probability(points_size);
++        std::vector<float> PHI_(points_size);
++        std::vector<float> PHI__(points_size);
++        const float discretize = 1.0f;     // Discretization value
++        std::vector<int> points_random_pool(points_size*100.0f/discretize);
++        unsigned int count = 0;
++        bool earlyStop = false;
++        float bansac_output_crit = 0.0;
++        RNG rng(0);
++
++        if (params->getSampler() == cv::SamplingMethod::SAMPLING_BANSAC || params->getSampler() == cv::SamplingMethod::SAMPLING_PBANSAC)
++        {
++            if (params->getSampler() == cv::SamplingMethod::SAMPLING_BANSAC)
++                bansac_output_crit = 0.01f;
++            if (params->getSampler() == cv::SamplingMethod::SAMPLING_PBANSAC)
++                bansac_output_crit = 0.1f;
++
++            std::vector<float> inputWeights = params->getWeights();
++            const bool wEmpty = inputWeights.empty();
++
++            // create sampling weights for the first iteration and fill weights with the uchar values
++            std::vector<unsigned short>::iterator itSampling = sampling.begin();
++            std::vector<float>::iterator itPriors = inputWeights.begin();
++            std::vector<float>::iterator itPHI_ = PHI_.begin();
++            std::vector<float>::iterator itPHI__ = PHI__.begin();
++            std::vector<float>::iterator itProb = probability.begin();
++
++            for (int i=0 ; i<points_size; i++, itSampling++, itPriors++, itPHI_++, itPHI__++, itProb++) {
++                const float prior = wEmpty ? 0.5f : (*itPriors);
++                *itSampling = (unsigned short)(prior*100.0f/discretize);
++                *itProb = prior;
++                *itPHI_ = prior;
++                *itPHI__ = 1.0f - prior;
++                for(unsigned short k=0; k<*itSampling; k++) {
++                    points_random_pool[count] = i;
++                    count++;
++                }
++            }
++        }
++        //------------------------------------------------------------------------------------------------------------------------------
++
+         if (! parallel) {
+             auto update_best = [&] (const Mat &new_model, const Score &new_score) {
+                 best_score = new_score;
+@@ -147,10 +195,35 @@ public:
+             // allocate memory for sample
+             std::vector<int> sample(_estimator->getMinimalSampleSize());
+             int iters = 0, max_iters = params->getMaxIters();
+-            for (; iters < max_iters; iters++) {
+-                _sampler->generateSample(sample);
++            for (; iters < max_iters; iters++)
++            {
++                if (params->getSampler() == cv::SamplingMethod::SAMPLING_BANSAC || params->getSampler() == cv::SamplingMethod::SAMPLING_PBANSAC)
++                {
++                    //------------------------------------------------------------------------------------------------------------------------------
++                    int random_pool_size = count; // random points of entire range
++                    for (int j = 0; j < _estimator->getMinimalSampleSize(); j++) {
++                        // get random point index
++                        const int array_random_index = rng.uniform(0, random_pool_size);
++                        // get point by random index
++                        // store sample
++                        sample[j] = points_random_pool[array_random_index];
++                        // swap random point with the end of random pool
++                        std::swap(points_random_pool[array_random_index],
++                                points_random_pool[--random_pool_size]);
++                    }
++                    //------------------------------------------------------------------------------------------------------------------------------
++                }
++                else {
++                    _sampler->generateSample(sample);
++                }
++
+                 const int number_of_models = _estimator->estimateModels(sample, models);
+
++                //------------------------------------------------------------------------------------------------------------------------------
++                cv::Mat localModel;
++                Score localScore;
++                //------------------------------------------------------------------------------------------------------------------------------
++
+                 for (int i = 0; i < number_of_models; i++) {
+                     if (iters < max_hyp_test_before_ver) {
+                         current_score = _quality->getScore(models[i]);
+@@ -168,6 +241,14 @@ public:
+                         } else continue;
+                     }
+
++                    //------------------------------------------------------------------------------------------------------------------------------
++                    if (current_score.isBetter(localScore))
++                    {
++                        localScore = current_score;
++                        models[i].copyTo(localModel);
++                    }
++                    //------------------------------------------------------------------------------------------------------------------------------
++
+                     if (current_score.isBetter(best_score)) {
+                         if (_degeneracy->recoverIfDegenerate(sample, models[i],
+                                 non_degenerate_model, non_denegenerate_model_score)) {
+@@ -200,6 +281,74 @@ public:
+                             max_iters = update_best(lo_model, lo_score);
+                         }
+                 }
++
++                //------------------------------------------------------------------------------------------------------------------------------
++                if (params->getSampler() == cv::SamplingMethod::SAMPLING_BANSAC || params->getSampler() == cv::SamplingMethod::SAMPLING_PBANSAC)
++                {
++                    if (!localModel.empty())
++                    {
++                        // Compute inlier ratio of the best model from the current iteration
++                        const float inlierRatio = localScore.inlier_number/(float)points_size;
++                        // Compute outlier ratio of the best model so far
++                        const float bestOutlierRatio = 1.0f - (best_score.inlier_number / (float)points_size);
++
++                        // Estimate value for the conditional probability table of P(C_k|X_k-1)
++                        const float classificationTableParam = (inlierRatio<0.7143f) ? (inlierRatio * 0.62f) + 0.5f : (inlierRatio * 0.2f) + 0.8f;
++
++                        // For each point see if is inlier or outlier and update inlier probability and sampling weight
++                        unsigned int outlierNumber = 0;
++                        std::vector<unsigned short>::iterator itSampling = sampling.begin();
++                        std::vector<float>::iterator itPHI_ = PHI_.begin();
++                        std::vector<float>::iterator itPHI__ = PHI__.begin();
++                        std::vector<float>::iterator itProb = probability.begin();
++
++                        error->setModelParameters(localModel);
++                        float PHIn_, PHIn__;
++
++                        points_random_pool.clear();
++                        count = 0;
++
++                        for (int point = 0 ; point < points_size; point++, itSampling++, itPHI_++, itPHI__++, itProb++)
++                        {
++                            // Update accordingly to the inlier/outlier classification
++                            const float erro = error->getError(point);
++                            if (erro < threshold) {
++                                PHIn_  =  1.0f*classificationTableParam*(*itPHI_) + 0.2f*(1.0f-classificationTableParam)*(*itPHI__);
++                                PHIn__ =  0.0f*classificationTableParam*(*itPHI_) + 0.8f*(1.0f-classificationTableParam)*(*itPHI__);
++                            }
++                            else {
++                                PHIn_  =  1.0f*(1.0f-classificationTableParam)*(*itPHI_) + 0.0f*classificationTableParam*(*itPHI__);
++                                PHIn__ =  0.0f*(1.0f-classificationTableParam)*(*itPHI_) + 1.0f*classificationTableParam*(*itPHI__);
++                            }
++                            (*itPHI_) = PHIn_;
++                            (*itPHI__) = PHIn__;
++                            const float newProb  = (*itPHI_)/((*itPHI_) + (*itPHI__));
++                            (*itProb) = newProb;
++
++                            // Stopping Criteria
++                            if (newProb < bansac_output_crit)
++                                outlierNumber++;
++
++                            // Sampling
++                            (*itSampling) = (unsigned short)(ceil(newProb*100.0f/discretize));
++
++                            for(unsigned short k=0; k<(*itSampling); k++) {
++                                points_random_pool[count] = point;
++                                count++;
++                            }
++                        }
++
++                        const float bestOutlierNumber = points_size * bestOutlierRatio;
++                        earlyStop = (outlierNumber >= bestOutlierNumber) ? true : false;
++                    }
++                }
++
++                if (earlyStop) {
++                    iters++;
++                    break;
++                }
++                // ------------------------------------------------------------------------------------------------------------------------------
++
+             } // end main while loop
+
+             final_iters = iters;
+@@ -426,6 +575,7 @@ void setParameters (Ptr<Model> &params, EstimationMethod estimator, const UsacPa
+     params->setNeighborsType(usac_params.neighborsSearch);
+     params->setRandomGeneratorState(usac_params.randomGeneratorState);
+     params->maskRequired(mask_needed);
++    params->setWeights(usac_params.weights);
+ }
+
+ void setParameters (int flag, Ptr<Model> &params, EstimationMethod estimator, double thr,
+@@ -585,6 +735,8 @@ private:
+     double threshold, confidence;
+     int sample_size, max_iterations;
+
++    std::vector<float> weights;
++
+     EstimationMethod estimator;
+     SamplingMethod sampler;
+     ScoreMethod score;
+@@ -627,7 +779,7 @@ private:
+
+     bool need_mask = true, is_parallel = false;
+     int random_generator_state = 0;
+-    const int max_iters_before_LO = 100;
++    const int max_iters_before_LO = 15;
+
+     // magsac parameters:
+     int DoF = 2;
+@@ -684,6 +836,7 @@ public:
+     void setVerifier (VerificationMethod verifier_) override { verifier = verifier_; }
+     void setPolisher (PolishingMethod polisher_) override { polisher = polisher_; }
+     void setParallel (bool is_parallel_) override { is_parallel = is_parallel_; }
++    void setWeights (std::vector<float> weights_) override { weights = weights_; }
+     void setError (ErrorMetric error_) override { est_error = error_; }
+     void setLocalOptimization (LocalOptimMethod lo_) override { lo = lo_; }
+     void setKNearestNeighhbors (int knn_) override { k_nearest_neighbors = knn_; }
+@@ -726,6 +879,7 @@ public:
+     ScoreMethod getScore () const override { return score; }
+     int getMaxIters () const override { return max_iterations; }
+     double getConfidence () const override { return confidence; }
++    std::vector<float> getWeights () const override { return weights; }
+     double getThreshold () const override { return threshold; }
+     VerificationMethod getVerifier () const override { return verifier; }
+     SamplingMethod getSampler () const override { return sampler; }
+@@ -823,6 +977,16 @@ bool run (const Ptr<const Model> &params, InputArray points1, InputArray points2
+     // threshold squared as well
+     threshold *= threshold;
+
++    // update points by calibrated for Essential matrix after graph is calculated
++    if (params->isEssential()) {
++        points = calib_points;
++        // if maximum calibrated threshold significanlty differs threshold then set upper bound
++        if (max_thr > 10*threshold)
++            max_thr = sqrt(10*threshold); // max thr will be squared after
++    }
++    if (max_thr < threshold)
++        max_thr = threshold;
++
+     if (params->getSampler() == SamplingMethod::SAMPLING_NAPSAC || params->getLO() == LocalOptimMethod::LOCAL_OPTIM_GC) {
+         if (params->getNeighborsSearch() == NeighborSearchMethod::NEIGH_GRID) {
+             graph = GridNeighborhoodGraph::create(points, points_size,
+@@ -862,16 +1026,6 @@ bool run (const Ptr<const Model> &params, InputArray points1, InputArray points2
+         }
+     }
+
+-    // update points by calibrated for Essential matrix after graph is calculated
+-    if (params->isEssential()) {
+-        points = calib_points;
+-        // if maximum calibrated threshold significanlty differs threshold then set upper bound
+-        if (max_thr > 10*threshold)
+-            max_thr = sqrt(10*threshold); // max thr will be squared after
+-    }
+-    if (max_thr < threshold)
+-        max_thr = threshold;
+-
+     switch (params->getError()) {
+         case ErrorMetric::SYMM_REPR_ERR:
+             error = ReprojectionErrorSymmetric::create(points); break;
+@@ -946,6 +1100,10 @@ bool run (const Ptr<const Model> &params, InputArray points1, InputArray points2
+             sampler = ProgressiveNapsac::create(state++, points_size, min_sample_size, layers, 20); break;
+         case SamplingMethod::SAMPLING_NAPSAC:
+             sampler = NapsacSampler::create(state++, points_size, min_sample_size, graph); break;
++        case SamplingMethod::SAMPLING_BANSAC:
++            break;
++        case SamplingMethod::SAMPLING_PBANSAC:
++            break;
+         default: CV_Error(cv::Error::StsNotImplemented, "Sampler is not implemented!");
+     }
+
+@@ -962,6 +1120,13 @@ bool run (const Ptr<const Model> &params, InputArray points1, InputArray points2
+         termination = ProsacTerminationCriteria::create(sampler.dynamicCast<ProsacSampler>(), error,
+                 points_size, min_sample_size, params->getConfidence(),
+                 params->getMaxIters(), 100, 0.05, 0.05, threshold);
++    } else if (params->getSampler() == SamplingMethod::SAMPLING_BANSAC) {
++        termination = SPRTTermination::create(((SPRT *) verifier.get())->getSPRTvector(),
++             params->getConfidence(), points_size, min_sample_size, params->getMaxIters());
++    } else if (params->getSampler() == SamplingMethod::SAMPLING_PBANSAC) {
++        termination = ProsacTerminationCriteria::create(sampler.dynamicCast<ProsacSampler>(), error,
++                points_size, min_sample_size, params->getConfidence(),
++                params->getMaxIters(), 100, 0.05, 0.05, threshold);
+     } else if (params->getSampler() == SamplingMethod::SAMPLING_PROGRESSIVE_NAPSAC) {
+         if (params->getVerifier() == VerificationMethod::SprtVerifier)
+             termination = SPRTPNapsacTermination::create(((SPRT *)verifier.get())->getSPRTvector(),
+@@ -1006,7 +1171,7 @@ bool run (const Ptr<const Model> &params, InputArray points1, InputArray points2
+         polisher = LeastSquaresPolishing::create(estimator, quality, params->getFinalLSQIterations());
+
+     Ransac ransac (params, points_size, estimator, quality, sampler,
+-          termination, verifier, degeneracy, lo, polisher, params->isParallel(), state);
++          termination, verifier, degeneracy, lo, polisher, error, threshold, params->isParallel(), state);
+     if (ransac.run(ransac_output)) {
+         if (params->isPnP()) {
+             // convert R to rodrigues and back and recalculate inliers which due to numerical
